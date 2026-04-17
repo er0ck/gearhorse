@@ -37,11 +37,15 @@ const BREVO_POLL_INTERVALS = [1_000, 2_000, 3_000];
 
 /**
  * Fill and submit the signup form.
- * Returns a promise that resolves to the alert message text shown on success.
+ * Returns the alert message text shown on success.
  * The dialog listener must be registered before click() — if it's set up after,
  * the alert can fire and auto-dismiss before Playwright catches it.
  */
-async function submitForm(page: Page, email: string): Promise<string> {
+async function submitForm(
+  page: Page,
+  email: string,
+  options: { phone?: string } = {},
+): Promise<string> {
   let alertText = '';
   const dialogPromise = new Promise<void>(resolve => {
     page.once('dialog', async dialog => {
@@ -52,6 +56,9 @@ async function submitForm(page: Page, email: string): Promise<string> {
   });
 
   await page.locator('input[type="email"]').fill(email);
+  if (options.phone) {
+    await page.locator('input[type="tel"]').fill(options.phone);
+  }
   await page.locator('button[type="submit"]').click();
 
   await dialogPromise;
@@ -157,6 +164,174 @@ test('signup stores site parameters on Brevo contact', async ({ page }) => {
     // SITE_FORM is the internal Carrd form ID — we just assert it is non-empty.
     const siteForm = contact.attributes['SITE_FORM'] as string | undefined;
     expect(siteForm).toBeTruthy();
+  } finally {
+    await deleteContact(email).catch(() => {});
+  }
+});
+
+// ---------------------------------------------------------------------------
+// SMS only (no email) — browser validation, never reaches Brevo
+// ---------------------------------------------------------------------------
+
+test('sms only: submission without email is blocked by browser validation', async ({ page }) => {
+  await page.goto(CARRD_URL);
+  await page.locator('input[type="tel"]').fill('+15551234567');
+  await page.locator('button[type="submit"]').click();
+  const validationMsg = await page
+    .locator('input[type="email"]')
+    .evaluate((el: HTMLInputElement) => el.validationMessage);
+  expect(validationMsg.length).toBeGreaterThan(0);
+});
+
+test('sms only edge case: phone below minimum length is blocked by browser validation', async ({ page }) => {
+  await page.goto(CARRD_URL);
+  // minlength="7" on the tel input — 6 digits should fail
+  await page.locator('input[type="tel"]').fill('123456');
+  await page.locator('button[type="submit"]').click();
+  const validationMsg = await page
+    .locator('input[type="tel"]')
+    .evaluate((el: HTMLInputElement) => el.validationMessage);
+  expect(validationMsg.length).toBeGreaterThan(0);
+});
+
+test('sms only edge case: phone with letters is blocked by pattern validation', async ({ page }) => {
+  await page.goto(CARRD_URL);
+  // pattern="[0-9\-\(\)+ #*]+" — letters are outside the allowed set
+  await page.locator('input[type="tel"]').fill('abc-invalid');
+  await page.locator('button[type="submit"]').click();
+  const validationMsg = await page
+    .locator('input[type="tel"]')
+    .evaluate((el: HTMLInputElement) => el.validationMessage);
+  expect(validationMsg.length).toBeGreaterThan(0);
+});
+
+// ---------------------------------------------------------------------------
+// Email + SMS → Brevo
+// ---------------------------------------------------------------------------
+
+test('email + sms creates contact with SMS attribute in Brevo', async ({ page }) => {
+  const email = testEmail('sms-basic');
+  const lid = listId();
+  const phone = '+15551234567';
+
+  try {
+    await page.goto(CARRD_URL);
+    const alert = await submitForm(page, email, { phone });
+    expect(alert, 'expected success alert after submission').toMatch(/thank|Ride/i);
+
+    await pollUntilContactExists(email);
+
+    const contact = (await getContact(email))!;
+    expect(contact.email).toBe(email);
+    expect(contact.listIds).toContain(lid);
+    expect(contact.emailBlacklisted).toBe(false);
+    expect(contact.smsBlacklisted).toBe(false);
+    expect(contact.attributes['PHONE']).toBe(phone);
+  } finally {
+    await deleteContact(email).catch(() => {});
+  }
+});
+
+test('email + sms with UTMs stores UTMs and SMS attribute in Brevo', async ({ page }) => {
+  const email = testEmail('sms-utm');
+  const lid = listId();
+  const phone = '+15551234567';
+
+  const utms = {
+    utm_source: 'tiktok',
+    utm_medium: 'social',
+    utm_campaign: 'launch-2026',
+    utm_term: 'camping',
+    utm_content: 'bio-link',
+  };
+  const qs = new URLSearchParams(utms).toString();
+
+  try {
+    await page.goto(`${CARRD_URL}/?${qs}`);
+    const alert = await submitForm(page, email, { phone });
+    expect(alert, 'expected success alert after submission').toMatch(/thank|Ride/i);
+
+    await pollUntilContactExists(email);
+
+    const contact = (await getContact(email))!;
+    expect(contact.listIds).toContain(lid);
+    expect(contact.attributes['PHONE']).toBe(phone);
+    expect(contact.attributes['UTM_SOURCE']).toBe(utms.utm_source);
+    expect(contact.attributes['UTM_MEDIUM']).toBe(utms.utm_medium);
+    expect(contact.attributes['UTM_CAMPAIGN']).toBe(utms.utm_campaign);
+    expect(contact.attributes['UTM_TERM']).toBe(utms.utm_term);
+    expect(contact.attributes['UTM_CONTENT']).toBe(utms.utm_content);
+  } finally {
+    await deleteContact(email).catch(() => {});
+  }
+});
+
+test('email + sms with site params stores site and SMS attributes in Brevo', async ({ page }) => {
+  const email = testEmail('sms-site');
+  const lid = listId();
+  const phone = '+15551234567';
+
+  try {
+    await page.goto(CARRD_URL);
+    const alert = await submitForm(page, email, { phone });
+    expect(alert, 'expected success alert after submission').toMatch(/thank|Ride/i);
+
+    await pollUntilContactExists(email);
+
+    const contact = (await getContact(email))!;
+    expect(contact.listIds).toContain(lid);
+    expect(contact.attributes['PHONE']).toBe(phone);
+
+    const siteUrl = contact.attributes['SITE_URL'] as string | undefined;
+    expect(siteUrl).toBeTruthy();
+    expect(siteUrl).toMatch(/gearhorse\.camp/i);
+
+    const siteForm = contact.attributes['SITE_FORM'] as string | undefined;
+    expect(siteForm).toBeTruthy();
+  } finally {
+    await deleteContact(email).catch(() => {});
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Email + SMS edge cases
+// ---------------------------------------------------------------------------
+
+test('email + sms edge case: international format (+44) is stored correctly in Brevo', async ({ page }) => {
+  const email = testEmail('sms-intl');
+  const phone = '+447911123456'; // UK mobile, valid E.164
+
+  try {
+    await page.goto(CARRD_URL);
+    const alert = await submitForm(page, email, { phone });
+    expect(alert, 'expected success alert after submission').toMatch(/thank|Ride/i);
+
+    await pollUntilContactExists(email);
+
+    const contact = (await getContact(email))!;
+    expect(contact.smsBlacklisted).toBe(false);
+    expect(contact.attributes['PHONE']).toBe(phone);
+  } finally {
+    await deleteContact(email).catch(() => {});
+  }
+});
+
+test('email + sms edge case: contact is not SMS-blacklisted after signup', async ({ page }) => {
+  // Brevo sets smsBlacklisted=true if a number previously unsubscribed.
+  // A fresh test address should always come back false.
+  const email = testEmail('sms-bl');
+  const phone = '+15559876543';
+
+  try {
+    await page.goto(CARRD_URL);
+    const alert = await submitForm(page, email, { phone });
+    expect(alert, 'expected success alert after submission').toMatch(/thank|Ride/i);
+
+    await pollUntilContactExists(email);
+
+    const contact = (await getContact(email))!;
+    expect(contact.smsBlacklisted).toBe(false);
+    expect(contact.attributes['PHONE']).toBe(phone);
   } finally {
     await deleteContact(email).catch(() => {});
   }
